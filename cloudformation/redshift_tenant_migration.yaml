@@ -1,0 +1,2328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Redshift tenant Migration and Schemas'
+
+Parameters:
+
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket for storing code artifacts
+    AllowedPattern: '^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name (3-63 chars, lowercase, numbers, hyphens, dots)
+
+  DataBucketName:
+    Type: String
+    Description: Name for the S3 bucket for storing Redshift data. Bucket should contain unload and temporary folders
+    AllowedPattern: '^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name (3-63 chars, lowercase, numbers, hyphens, dots)
+
+  TargetSecretArn:
+    Type: String
+    Description: ARN of the target Redshift secret in Secrets Manager
+    AllowedPattern: '^arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:.+$'
+    ConstraintDescription: Must be a valid Secrets Manager ARN
+
+  SourceSecretArn:
+    Type: String
+    Description: ARN of the source Redshift secret in Secrets Manager
+    AllowedPattern: '^arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:.+$'
+    ConstraintDescription: Must be a valid Secrets Manager ARN
+
+  Schema:
+    Type: String
+    Description: Schema name for the job. Accepts a single value. Make sure the schema format is as "('SCHEMA')"
+    Default: "('sales_data')"
+    AllowedPattern: "^\\('[a-zA-Z_][a-zA-Z0-9_]*'\\)$"
+    ConstraintDescription: "Must be in format ('schema_name') with valid SQL identifier characters"
+
+  Region:
+    Type: String
+    Description: Enter Region Name
+    Default: 'us-east-1'
+    AllowedPattern: '^[a-z]{2}-[a-z]+-\d{1}$'
+    ConstraintDescription: Must be a valid AWS region (e.g., us-east-1, eu-west-2)
+
+  TenantName:
+    Type: String
+    Description: Name of the tenant
+    Default: sales_data
+    AllowedPattern: '^[a-zA-Z_][a-zA-Z0-9_]{0,127}$'
+    ConstraintDescription: Must be a valid identifier (letters, numbers, underscores, max 128 chars)
+
+  RedshiftServerlessPort:
+    Type: Number
+    Description: Redshift Serverless Port
+    Default: 5439
+    MinValue: 1024
+    MaxValue: 65535
+
+  SecurityGroupSSM:
+    Type: String
+    Description: SSM parameter name for security group ID
+    Default: SecurityGroupId
+    AllowedPattern: '^[a-zA-Z0-9_./\-]+$'
+    ConstraintDescription: Must be a valid SSM parameter name
+
+  SubnetSSM:
+    Type: String
+    Description: SSM parameter name for subnet IDs (comma-separated)
+    Default: Subnet
+    AllowedPattern: '^[a-zA-Z0-9_./\-]+$'
+    ConstraintDescription: Must be a valid SSM parameter name
+
+  VpcSSM:
+    Type: String
+    Description: SSM parameter name for VPC ID
+    Default: VpcId
+    AllowedPattern: '^[a-zA-Z0-9_./\-]+$'
+    ConstraintDescription: Must be a valid SSM parameter name
+
+Resources:
+
+  GlueCloudWatchKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Glue CloudWatch Logs and Job Bookmarks encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: Allow Glue Service
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:Encrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+                'kms:ViaService': !Sub 'glue.${AWS::Region}.amazonaws.com'
+              ArnLike:
+                'kms:EncryptionContext:aws:glue:*': !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:*'
+
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+
+          - Sid: Allow Glue Role
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GlueServiceRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+                'aws:PrincipalArn': !GetAtt GlueServiceRole.Arn
+              ArnLike:
+                'kms:EncryptionContext:aws:glue:*': !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:*'
+                'kms:EncryptionContext:aws:logs:arn': [
+                  !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*',
+                  !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/glue-security-config-role/*'
+                ]
+
+          - Sid: Allow Step Functions CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+                'kms:ViaService': !Sub 'logs.${AWS::Region}.amazonaws.com'
+
+  # KMS Key Alias
+  GlueCloudWatchKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-glue-key'
+      TargetKeyId: !Ref GlueCloudWatchKMSKey
+
+  # Glue Security Configuration
+  GlueSecurityConfiguration:
+    Type: AWS::Glue::SecurityConfiguration
+    Properties:
+      Name: !Sub "${AWS::StackName}-security-config"
+      EncryptionConfiguration:
+        CloudWatchEncryption:
+          CloudWatchEncryptionMode: SSE-KMS
+          KmsKeyArn: !GetAtt GlueCloudWatchKMSKey.Arn
+        JobBookmarksEncryption:
+          JobBookmarksEncryptionMode: CSE-KMS
+          KmsKeyArn: !GetAtt GlueCloudWatchKMSKey.Arn
+
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GlueServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: GlueServiceRolePolicy
+      Roles:
+        - !Ref GlueServiceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:ListStacks
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*"
+
+          - Effect: Allow
+            Action:
+              - ec2:DescribeVpcEndpoints
+              - ec2:DescribeRouteTables
+              - ec2:CreateNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeVpcs
+              - ec2:DescribeAvailabilityZones
+              - ec2:DeleteNetworkInterfacePermission
+            Resource: "*"
+
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+              - iam:ListRoles
+            Resource: "*"
+            Condition:
+              StringLike:
+                iam:PassedToService:
+                  - lambda.amazonaws.com
+                  - glue.amazonaws.com
+                  - redshift.amazonaws.com
+                  - redshift-serverless.amazonaws.com
+
+          - Effect: Allow
+            Action:
+              - iam:ListRolePolicies
+              - iam:GetRolePolicy
+              - iam:ListRoles
+              - iam:GetRole
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+
+          - Effect: Allow
+            Action: cloudwatch:PutMetricData
+            Resource: "*"
+            Condition:
+              StringEquals:
+                'cloudwatch:namespace': ['Glue', 'AWS/Glue']
+
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:ListAllMyBuckets
+              - s3:GetBucketAcl
+            Resource:
+              - !Sub "arn:aws:s3:::${BucketName}"
+              - !Sub "arn:aws:s3:::${DataBucketName}"
+
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource:
+              - !Sub "arn:aws:s3:::${BucketName}/*"
+              - !Sub "arn:aws:s3:::${DataBucketName}/*"
+
+          - Effect: Allow
+            Action:
+              - redshift-serverless:GetCredentials
+              - redshift-serverless:GetWorkgroup
+              - redshift-serverless:UpdateWorkgroup
+              - redshift-serverless:ListWorkgroups
+              - redshift:GetClusterCredentials
+              - redshift-data:ExecuteStatement
+              - redshift-data:DescribeStatement
+              - redshift-data:GetStatementResult
+              - redshift-serverless:ListNamespaces
+              - redshift-serverless:GetNamespace
+              - redshift-serverless:UpdateNamespace
+              - redshift:ModifyClusterIamRoles
+              - redshift:DescribeClusters
+            Resource:
+              - !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+              - !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:namespace/*"
+              - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:*"
+
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:ListSecrets
+            Resource:
+              -  "*"
+
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/python-jobs/*'
+
+          - Effect: Allow
+            Action:
+                - kms:Decrypt
+                - kms:Encrypt
+                - kms:GenerateDataKey
+            Resource: !GetAtt GlueCloudWatchKMSKey.Arn
+
+          - Effect: Allow
+            Action:
+                - logs:AssociateKmsKey
+            Resource:
+                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+                - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/python-jobs/*'
+
+  LambdaPermissionBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: LambdaPermissionBoundary
+      Description: Permission boundary for Lambda execution roles - defines maximum allowed permissions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Redshift Serverless & Provisioned
+          - Effect: Allow
+            Action:
+              - redshift-serverless:GetCredentials
+              - redshift-serverless:GetWorkgroup
+              - redshift-serverless:UpdateWorkgroup
+              - redshift-serverless:ListWorkgroups
+              - redshift-serverless:ListNamespaces
+              - redshift-serverless:GetNamespace
+              - redshift-serverless:UpdateNamespace
+              - redshift:GetClusterCredentials
+              - redshift-data:ExecuteStatement
+              - redshift-data:DescribeStatement
+              - redshift-data:GetStatementResult
+            Resource:
+              - !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+              - !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:namespace/*"
+              - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:*"
+
+          # S3
+          # Note: BucketName and DataBucketName are separate parameters that MAY resolve
+          # to the same bucket. Both are listed to support split-bucket deployments.
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${BucketName}"
+              - !Sub "arn:aws:s3:::${DataBucketName}"
+
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub "arn:aws:s3:::${BucketName}/*"
+              - !Sub "arn:aws:s3:::${DataBucketName}/*"
+
+          # EC2 / VPC networking (Lambda VPC management requires "*" for ENI operations)
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:AssignPrivateIpAddresses
+              - ec2:UnassignPrivateIpAddresses
+            Resource: "*"
+
+          # CloudFormation (read + update for tenant stack operations)
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:ListStacks
+              - cloudformation:UpdateStack
+              - cloudformation:GetTemplateSummary
+              - cloudformation:GetTemplate
+              - cloudformation:DescribeStackEvents
+              - cloudformation:ListStackResources
+              - cloudformation:DescribeStackResource
+              - cloudformation:DescribeStackResources
+            Resource:
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*"
+
+          # Secrets Manager
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:CreateSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+              - secretsmanager:TagResource
+              - secretsmanager:UntagResource
+              - secretsmanager:DeleteSecret
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+          - Effect: Allow
+            Action:
+              - secretsmanager:ListSecrets
+            Resource: "*"
+
+          # IAM (scoped to account)
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:PutRolePolicy
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:GetPolicy
+              - iam:GetPolicyVersion
+              - iam:DeleteUserPolicy
+              - iam:PutUserPolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:DeleteRolePolicy
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:user/*"
+          - Effect: Allow
+            Action:
+              - iam:GetUser
+              - iam:GetUserPolicy
+              - iam:CreateUser
+              - iam:ListAccessKeys
+              - iam:TagUser
+              - iam:CreateAccessKey
+              - iam:DeleteUser
+              - iam:DeleteAccessKey
+              - iam:DeleteUserPolicy
+              - iam:PutUserPolicy
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:user/*"
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+              - iam:ListRoles
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+            Condition:
+              StringEquals:
+                iam:PassedToService:
+                  - lambda.amazonaws.com
+                  - glue.amazonaws.com
+                  - redshift.amazonaws.com
+                  - redshift-serverless.amazonaws.com
+                  - events.amazonaws.com
+                  - scheduler.amazonaws.com
+                  - codebuild.amazonaws.com
+                  - kinesisanalytics.amazonaws.com
+          - Effect: Allow
+            Action:
+              - iam:ListRoles
+            Resource: "*"
+
+          # SSM
+          - Effect: Allow
+            Action:
+              - ssm:GetParameters
+              - ssm:GetParameter
+              - ssm:GetParametersByPath
+            Resource:
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+          # Lambda
+          - Effect: Allow
+            Action:
+              - lambda:GetFunction
+              - lambda:UpdateFunctionConfiguration
+              - lambda:GetFunctionConfiguration
+              - lambda:UpdateFunctionCode
+              - lambda:ListFunctions
+              - lambda:ListTags
+              - lambda:TagResource
+              - lambda:UntagResource
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+          # EventBridge
+          - Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:RemoveTargets
+              - events:PutRule
+              - events:DeleteRule
+              - events:DescribeRule
+              - events:EnableRule
+              - events:DisableRule
+              - events:ListTargetsByRule
+            Resource:
+              - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+          # CodeBuild
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetProjects
+              - codebuild:BatchGetBuilds
+              - codebuild:ListProjects
+              - codebuild:StartBuild
+              - codebuild:StopBuild
+              - codebuild:UpdateProject
+            Resource:
+              - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/*"
+
+          # Kinesis Analytics
+          - Effect: Allow
+            Action:
+              - kinesisanalytics:DescribeApplication
+              - kinesisanalytics:UpdateApplication
+              - kinesisanalytics:StopApplication
+              - kinesisanalytics:StartApplication
+              - kinesisanalytics:ListTagsForResource
+              - kinesisanalytics:TagResource
+              - kinesisanalytics:UntagResource
+            Resource:
+              - !Sub "arn:aws:kinesisanalytics:${AWS::Region}:${AWS::AccountId}:application/*"
+
+          # CloudWatch Logs
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:PutMetricFilter
+              - logs:DeleteMetricFilter
+              - logs:DescribeMetricFilters
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: LambdaPermissionBoundary
+    Properties:
+      PermissionsBoundary: !Ref LambdaPermissionBoundary
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RedshiftAndSecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift-serverless:GetCredentials
+                  - redshift-serverless:GetWorkgroup
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-serverless:UpdateWorkgroup
+                  - redshift-serverless:ListWorkgroups
+                  - redshift:GetClusterCredentials
+                  - redshift-serverless:ListNamespaces
+                  - redshift-serverless:GetNamespace
+                  - redshift-serverless:UpdateNamespace
+
+                Resource:
+                  - "arn:aws:redshift-serverless:*:*:workgroup/*"
+                  - "arn:aws:redshift-serverless:*:*:namespace/*"
+
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${DataBucketName}"
+
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+                  - !Sub "arn:aws:s3:::${DataBucketName}/*"
+
+              # VPC permissions - Lambda VPC management requires "*" for ENI operations
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: "*"
+
+              # CloudFormation permissions
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:GetTemplate
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:ListStackResources
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                Resource:
+                  -  !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*"
+
+              # Extended Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                  - secretsmanager:DeleteSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+              - Effect: Allow
+                Action:
+                  - secretsmanager:ListSecrets
+                Resource: "*"
+
+              # IAM permissions
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:DeleteUserPolicy
+                  - iam:PutUserPolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:DeleteRolePolicy
+                Resource:
+                  - "arn:aws:iam::*:role/*"
+                  - "arn:aws:iam::*:policy/*"
+                  - "arn:aws:iam::*:user/*"
+
+              - Effect: Allow
+                Action:
+                  - iam:GetUser
+                  - iam:GetUserPolicy
+                  - iam:CreateUser
+                  - iam:ListAccessKeys
+                  - iam:TagUser
+                  - iam:CreateAccessKey
+                  - iam:DeleteUser
+                  - iam:DeleteAccessKey
+                  - iam:DeleteUserPolicy
+                  - iam:PutUserPolicy
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:user/*"
+
+              - Effect: Allow
+                Action:
+                  - kinesisanalytics:DescribeApplication
+                  - kinesisanalytics:UpdateApplication
+                  - kinesisanalytics:StopApplication
+                  - kinesisanalytics:StartApplication
+                  - kinesisanalytics:ListTagsForResource
+                  - kinesisanalytics:TagResource
+                  - kinesisanalytics:UntagResource
+                Resource: !Sub 'arn:aws:kinesisanalytics:${AWS::Region}:${AWS::AccountId}:application/*'
+
+
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:ListRoles
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - glue.amazonaws.com
+                      - redshift.amazonaws.com
+                      - redshift-serverless.amazonaws.com
+                      - events.amazonaws.com
+                      - scheduler.amazonaws.com
+                      - codebuild.amazonaws.com
+                      - kinesisanalytics.amazonaws.com
+
+
+              - Effect: Allow
+                Action: iam:ListRoles
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:EnableRule
+                  - events:DisableRule
+                  - events:ListTargetsByRule
+                Resource:
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetProjects
+                  - codebuild:BatchGetBuilds
+                  - codebuild:ListProjects
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:UpdateProject
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/*"
+
+              - Effect: Allow
+                Action:
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeMetricFilters
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+
+  RedshiftConnectorLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: redshift-connector-layer
+      Description: Layer containing redshift_connector package
+      Content:
+        S3Bucket: !Ref BucketName
+        S3Key: redshift-tenant-migration/layers/redshift_connector.zip  # Make sure this zip exists in your S3 bucket
+      CompatibleRuntimes:
+        - python3.9
+        - python3.13
+      CompatibleArchitectures:
+        - x86_64
+
+  NetworkConfigFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SSM Parameter Access
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:DescribeParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+              # EC2 Security Group Describe Actions - requires "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+                # EC2 Describe APIs only support "*" as resource
+
+              # EC2 Security Group Modification Actions
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+
+  NetworkConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.13
+      Timeout: 300
+      Role: !GetAtt NetworkConfigFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import traceback
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_ssm_parameter(ssm_client, param_name):
+              try:
+                  logger.info(f"Attempting to get SSM parameter: {param_name}")
+                  response = ssm_client.get_parameter(Name=param_name)
+                  logger.info(f"Successfully retrieved parameter {param_name}: {response['Parameter']['Value']}")
+                  return response['Parameter']['Value']
+              except Exception as e:
+                  logger.error(f"Error getting SSM parameter {param_name}: {str(e)}")
+                  raise
+
+          def get_ssm_parameters(ssm_client, params):
+              """Get multiple SSM parameters and combine their values"""
+              try:
+                  all_values = []
+                  param_names = params.split(',')
+                  for param_name in param_names:
+                      param_name = param_name.strip()
+                      if param_name:  # Only process non-empty parameter names
+                          value = get_ssm_parameter(ssm_client, param_name)
+                          if value:
+                              all_values.extend([v.strip() for v in value.split(',') if v.strip()])
+                  return list(set(all_values))  # Remove duplicates
+              except Exception as e:
+                  logger.error(f"Error getting SSM parameters {params}: {str(e)}")
+                  raise
+
+          def filter_security_groups_by_vpc(ec2_client, security_group_ids, vpc_id):
+              """Filter security groups to only include those in the specified VPC"""
+              try:
+                  response = ec2_client.describe_security_groups(
+                      GroupIds=security_group_ids
+                  )
+                  vpc_security_groups = [
+                      sg['GroupId'] for sg in response['SecurityGroups']
+                      if sg['VpcId'] == vpc_id
+                  ]
+                  logger.info(f"Security groups in VPC {vpc_id}: {vpc_security_groups}")
+                  return vpc_security_groups
+              except Exception as e:
+                  logger.error(f"Error filtering security groups: {str(e)}")
+                  raise
+
+          def get_redshift_security_groups(ec2_client, vpc_id):
+              """Get Redshift security groups from the specified VPC"""
+              try:
+                  response = ec2_client.describe_security_groups(
+                      Filters=[
+                          {'Name': 'vpc-id', 'Values': [vpc_id]},
+                          {'Name': 'group-name', 'Values': ['*redshift*']}
+                      ]
+                  )
+                  redshift_sgs = [sg['GroupId'] for sg in response['SecurityGroups']]
+                  logger.info(f"Redshift security groups in VPC {vpc_id}: {redshift_sgs}")
+                  return redshift_sgs
+              except Exception as e:
+                  logger.error(f"Error getting Redshift security groups: {str(e)}")
+                  raise
+
+          def add_ingress_rules(ec2_client, security_group_ids, redshift_sgs, port):
+              """Add ingress rules for security groups"""
+              for sg_id in security_group_ids:
+                  logger.info(f"Adding ingress rules for security group: {sg_id}")
+                  try:
+                      ec2_client.authorize_security_group_ingress(
+                          GroupId=sg_id,
+                          IpPermissions=[{
+                              'IpProtocol': 'tcp',
+                              'FromPort': port,
+                              'ToPort': port,
+                              'UserIdGroupPairs': [{
+                                  'GroupId': rs_sg,
+                                  'Description': f'Allow Redshift access on port {port}'
+                              } for rs_sg in redshift_sgs]
+                          }]
+                      )
+                      logger.info(f"Successfully added ingress rules for {sg_id}")
+                  except ec2_client.exceptions.ClientError as e:
+                      if 'InvalidPermission.Duplicate' in str(e):
+                          logger.info(f"Rules already exist for {sg_id}, skipping")
+                      else:
+                          raise
+
+          def validate_subnets(ec2_client, subnet_ids, vpc_id):
+              """Validate that subnets exist and belong to the specified VPC"""
+              try:
+                  response = ec2_client.describe_subnets(
+                      SubnetIds=subnet_ids
+                  )
+                  valid_subnets = [
+                      subnet['SubnetId']
+                      for subnet in response['Subnets']
+                      if subnet['VpcId'] == vpc_id
+                  ]
+                  logger.info(f"Valid subnets in VPC {vpc_id}: {valid_subnets}")
+                  return valid_subnets
+              except Exception as e:
+                  logger.error(f"Error validating subnets: {str(e)}")
+                  raise
+
+          def handler(event, context):
+              logger.info(f"Event received: {json.dumps(event, indent=2)}")
+
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Initialize clients
+                      ssm = boto3.client('ssm')
+                      ec2 = boto3.client('ec2')
+
+                      # Get parameters
+                      sg_param_name = event['ResourceProperties']['SecurityGroupSSM']
+                      subnet_param_name = event['ResourceProperties']['SubnetSSM']
+                      vpc_param_name = event['ResourceProperties']['VpcSSM']
+                      port = int(event['ResourceProperties'].get('RedshiftServerlessPort', 5439))
+
+                      # Get values from SSM
+                      sg_ids_str = get_ssm_parameter(ssm, sg_param_name)
+                      #subnet_ids_str = get_ssm_parameter(ssm, subnet_param_name)
+                      subnet_ids = get_ssm_parameters(ssm, subnet_param_name)
+                      vpc_id = get_ssm_parameter(ssm, vpc_param_name)
+
+                      # Parse security group IDs
+                      all_security_group_ids = [sg.strip() for sg in sg_ids_str.split(',') if sg.strip()]
+
+                      # Filter security groups by VPC
+                      security_group_ids = filter_security_groups_by_vpc(ec2, all_security_group_ids, vpc_id)
+                      if not security_group_ids:
+                          raise Exception(f"No security groups found in VPC {vpc_id}")
+
+                      # Validate subnets
+                      valid_subnet_ids = validate_subnets(ec2, subnet_ids, vpc_id)
+                      if not valid_subnet_ids:
+                          raise Exception(f"No valid subnets found in VPC {vpc_id}")
+
+                      # Get Redshift security groups in the same VPC
+                      redshift_sgs = get_redshift_security_groups(ec2, vpc_id)
+                      if not redshift_sgs:
+                          logger.warning(f"No Redshift security groups found in VPC {vpc_id}")
+
+                      # Add ingress rules
+                      if redshift_sgs:
+                          add_ingress_rules(ec2, security_group_ids, redshift_sgs, port)
+
+                      response_data = {
+                          'SecurityGroupId': security_group_ids[0],
+                          'SecurityGroupIds': security_group_ids,
+                          'SubnetIds': subnet_ids,
+                          'VpcId': vpc_id
+                      }
+
+                      logger.info(f"Sending success response: {json.dumps(response_data, indent=2)}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+                  elif event['RequestType'] == 'Delete':
+                      logger.info("Delete request - sending success response")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+                  else:
+                      raise Exception(f"Unexpected request type: {event['RequestType']}")
+
+              except Exception as e:
+                  error_msg = f"Error in handler: {str(e)}"
+                  logger.error(error_msg)
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": error_msg})
+
+  NetworkConfig:
+      Type: Custom::NetworkConfig
+      DependsOn:
+        - NetworkConfigFunction
+        - NetworkConfigFunctionRole
+      Properties:
+        ServiceToken: !GetAtt NetworkConfigFunction.Arn
+        SecurityGroupSSM: !Ref SecurityGroupSSM
+        SubnetSSM: !Ref SubnetSSM
+        VpcSSM: !Ref VpcSSM
+        RedshiftServerlessPort: !Ref RedshiftServerlessPort
+
+  VPCEndpointCheckerForEC2:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt VPCEndpointCheckerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      ec2 = boto3.client('ec2')
+                      vpc_id = event['ResourceProperties']['VpcId']
+                      security_group_id = event['ResourceProperties']['SecurityGroupId']
+                      subnet_ids = event['ResourceProperties']['SubnetIds']
+                      region = event['ResourceProperties']['Region']
+
+                      # Check if EC2 endpoint exists
+                      response = ec2.describe_vpc_endpoints(
+                          Filters=[
+                              {'Name': 'vpc-id', 'Values': [vpc_id]},
+                              {'Name': 'service-name', 'Values': [f"com.amazonaws.{region}.ec2"]}
+                          ]
+                      )
+
+                      if not response['VpcEndpoints']:
+                          logger.info("Creating EC2 VPC endpoint...")
+                          result = ec2.create_vpc_endpoint(
+                              VpcEndpointType='Interface',
+                              VpcId=vpc_id,
+                              ServiceName=f"com.amazonaws.{region}.ec2",
+                              SubnetIds=subnet_ids if isinstance(subnet_ids, list) else subnet_ids.split(','),
+                              SecurityGroupIds=[security_group_id],
+                              PrivateDnsEnabled=True
+                          )
+                          endpoint_id = result['VpcEndpoint']['VpcEndpointId']
+                      else:
+                          endpoint_id = response['VpcEndpoints'][0]['VpcEndpointId']
+                          # Update security groups if needed
+                          ec2.modify_vpc_endpoint(
+                              VpcEndpointId=endpoint_id,
+                              AddSecurityGroupIds=[security_group_id]
+                          )
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                     {'EndpointId': endpoint_id})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                 {"Error": str(e)})
+      Runtime: python3.13
+      Timeout: 900
+
+  EC2EndpointSetup:
+    Type: Custom::EC2EndpointSetup
+    DependsOn: NetworkConfig
+    Properties:
+      ServiceToken: !GetAtt VPCEndpointCheckerForEC2.Arn
+      VpcId: !GetAtt NetworkConfig.VpcId
+      Region: !Ref AWS::Region
+      SecurityGroupId: !GetAtt NetworkConfig.SecurityGroupId
+      SubnetIds: !GetAtt NetworkConfig.SubnetIds
+
+
+  SecurityGroupCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityGroupAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 Describe Actions - requires "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                  - ec2:AuthorizeSecurityGroupIngress
+                Resource: "*"
+
+              # SSM Parameter Access
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+
+  SecurityGroupSelfReferenceChecker:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - NetworkConfig
+      - SecurityGroupCheckerRole
+    Properties:
+      Handler: index.handler
+      Runtime: python3.13
+      Timeout: 300
+      Role: !GetAtt SecurityGroupCheckerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+          import traceback
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_ssm_parameter(ssm_client, param_name):
+              """Get parameter from SSM with validation"""
+              try:
+                  logger.info(f"Getting SSM parameter: {param_name}")
+                  response = ssm_client.get_parameter(Name=param_name)
+                  value = response['Parameter']['Value']
+                  if not value:
+                      raise ValueError(f"Empty value for SSM parameter: {param_name}")
+                  logger.info(f"Successfully retrieved SSM parameter: {param_name}")
+                  return value
+              except Exception as e:
+                  logger.error(f"Error getting SSM parameter: {str(e)}")
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  raise
+
+          def check_and_add_self_referencing_rule(sg_ids):
+              """Check and add self-referencing rule with retries"""
+              if isinstance(sg_ids, str):
+                  sg_ids = [sg.strip() for sg in sg_ids.split(',')]
+
+              logger.info(f"Processing security groups: {sg_ids}")
+              results = []
+
+              for sg_id in sg_ids:
+                  max_retries = 3
+                  retry_delay = 2
+
+                  for attempt in range(max_retries):
+                      try:
+                          logger.info(f"Checking security group {sg_id} (attempt {attempt + 1})")
+                          ec2 = boto3.client('ec2')
+
+                          # Validate security group exists
+                          response = ec2.describe_security_groups(GroupIds=[sg_id])
+                          if not response['SecurityGroups']:
+                              raise ValueError(f"Security group {sg_id} not found")
+
+                          sg = response['SecurityGroups'][0]
+                          has_self_rule = False
+
+                          # Check existing rules
+                          for rule in sg['IpPermissions']:
+                              if rule.get('IpProtocol') == '-1':
+                                  for pair in rule.get('UserIdGroupPairs', []):
+                                      if pair['GroupId'] == sg_id:
+                                          has_self_rule = True
+                                          logger.info(f"Self-referencing rule already exists for {sg_id}")
+                                          break
+
+                          # Add rule if needed
+                          if not has_self_rule:
+                              logger.info(f"Adding self-referencing rule to {sg_id}")
+                              ec2.authorize_security_group_ingress(
+                                  GroupId=sg_id,
+                                  IpPermissions=[{
+                                      'IpProtocol': '-1',
+                                      'FromPort': -1,
+                                      'ToPort': -1,
+                                      'UserIdGroupPairs': [{
+                                          'GroupId': sg_id,
+                                          'Description': 'Allow all traffic from self'
+                                      }]
+                                  }]
+                              )
+                              logger.info(f"Successfully added self-referencing rule to {sg_id}")
+
+                          results.append({'SecurityGroupId': sg_id, 'Success': True})
+                          break  # Break retry loop if successful
+
+                      except Exception as e:
+                          if attempt == max_retries - 1:
+                              logger.error(f"Final attempt failed for {sg_id}: {str(e)}")
+                              logger.error(f"Traceback: {traceback.format_exc()}")
+                              results.append({'SecurityGroupId': sg_id, 'Success': False, 'Error': str(e)})
+                          else:
+                              logger.warning(f"Attempt {attempt + 1} failed for {sg_id}, retrying in {retry_delay} seconds")
+                              time.sleep(retry_delay)
+
+              return results
+
+          def handler(event, context):
+              logger.info(f"Event received: {event}")
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      ssm = boto3.client('ssm')
+                      param_name = event['ResourceProperties']['SecurityGroupSSM']
+
+                      # Get and validate security group IDs
+                      sg_ids = get_ssm_parameter(ssm, param_name)
+
+                      results = check_and_add_self_referencing_rule(sg_ids)
+
+                      # Check if all operations were successful
+                      all_success = all(result['Success'] for result in results)
+
+                      response_data = {
+                          'SecurityGroupId': sg_ids,  # Keep original string for backward compatibility
+                          'SecurityGroupIds': [r['SecurityGroupId'] for r in results],
+                          'Status': 'Success' if all_success else 'Failed',
+                          'Results': results
+                      }
+
+                      logger.info(f"Sending response: {response_data}")
+                      cfnresponse.send(event, context,
+                          cfnresponse.SUCCESS if all_success else cfnresponse.FAILED,
+                          response_data)
+                  else:
+                      logger.info(f"Request type is {event['RequestType']}, sending success response")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  error_msg = f"Error in handler: {str(e)}"
+                  logger.error(error_msg)
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                 {"Error": error_msg})
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkConfig.SecurityGroupId
+        SubnetIds: !GetAtt NetworkConfig.SubnetIds
+
+  SecurityGroupCheck:
+    Type: Custom::SecurityGroupCheck
+    DependsOn:
+      - NetworkConfig
+      - VPCEndpointUpdate
+    Properties:
+      ServiceToken: !GetAtt SecurityGroupSelfReferenceChecker.Arn
+      SecurityGroupSSM: !Ref SecurityGroupSSM
+
+
+  VPCEndpointCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VPCEndpointAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcEndpointServices
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcEndpointServices
+                  - ec2:DescribeSubnets
+                Resource: "*"
+
+              # VPC Network Interface Permissions
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:AttachNetworkInterface
+                  - ec2:DetachNetworkInterface
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+
+
+
+  VPCEndpointChecker:
+    Type: AWS::Lambda::Function
+    DependsOn: NetworkConfig
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt VPCEndpointCheckerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import traceback
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_supported_azs_for_service(ec2_client, service_name):
+              """Get AZs supported by the VPC endpoint service"""
+              try:
+                  response = ec2_client.describe_vpc_endpoint_services(
+                      ServiceNames=[service_name]
+                  )
+                  if response['ServiceDetails']:
+                      return set(response['ServiceDetails'][0]['AvailabilityZones'])
+              except Exception as e:
+                  logger.error(f"Error getting supported AZs for {service_name}: {str(e)}")
+                  return set()
+              return set()
+
+          def select_supported_subnets(ec2_client, subnet_ids, service_name):
+              """Select one subnet per AZ, but only from supported AZs"""
+              supported_azs = get_supported_azs_for_service(ec2_client, service_name)
+              logger.info(f"Supported AZs for {service_name}: {supported_azs}")
+
+              subnet_az_map = get_subnet_az_mapping(ec2_client, subnet_ids)
+
+              selected_subnets = []
+              used_azs = set()
+
+              for subnet_id, az in subnet_az_map.items():
+                  if az in supported_azs and az not in used_azs:
+                      selected_subnets.append(subnet_id)
+                      used_azs.add(az)
+
+              logger.info(f"Selected subnets for {service_name}: {selected_subnets}")
+              return selected_subnets
+
+          def ensure_ec2_endpoint(ec2_client, vpc_id, subnet_ids, security_group_id, region):
+              """Ensure EC2 endpoint exists"""
+              ec2_service = f"com.amazonaws.{region}.ec2"
+              try:
+                  response = ec2_client.describe_vpc_endpoints(
+                      Filters=[
+                          {'Name': 'vpc-id', 'Values': [vpc_id]},
+                          {'Name': 'service-name', 'Values': [ec2_service]}
+                      ]
+                  )
+
+                  if not response['VpcEndpoints']:
+                      logger.info("Creating EC2 VPC endpoint...")
+                      ec2_client.create_vpc_endpoint(
+                          VpcEndpointType='Interface',
+                          VpcId=vpc_id,
+                          ServiceName=ec2_service,
+                          SubnetIds=subnet_ids if isinstance(subnet_ids, list) else subnet_ids.split(','),
+                          SecurityGroupIds=[security_group_id],
+                          PrivateDnsEnabled=True
+                      )
+                      logger.info("EC2 VPC endpoint created")
+              except Exception as e:
+                  logger.error(f"Error ensuring EC2 endpoint: {str(e)}")
+                  raise
+
+          def get_subnet_az_mapping(ec2_client, subnet_ids):
+              """Get mapping of subnet IDs to their Availability Zones"""
+              try:
+                  response = ec2_client.describe_subnets(SubnetIds=subnet_ids)
+                  return {subnet['SubnetId']: subnet['AvailabilityZone']
+                          for subnet in response['Subnets']}
+              except Exception as e:
+                  logger.error(f"Error getting subnet AZ mapping: {str(e)}")
+                  raise
+
+          def select_one_subnet_per_az(ec2_client, subnet_ids):
+              """Select one subnet per AZ from the provided subnet IDs"""
+              subnet_az_map = get_subnet_az_mapping(ec2_client, subnet_ids)
+              selected_subnets = []
+              used_azs = set()
+
+              for subnet_id, az in subnet_az_map.items():
+                  if az not in used_azs:
+                      selected_subnets.append(subnet_id)
+                      used_azs.add(az)
+
+              return selected_subnets
+
+          def handler(event, context):
+              logger.info(f"Event received: {json.dumps(event, indent=2)}")
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      logger.info("Processing Create/Update request")
+                      ec2 = boto3.client('ec2')
+
+                      props = event.get('ResourceProperties', {})
+                      logger.info(f"All properties: {json.dumps(props, indent=2)}")
+
+                      vpc_id = props.get('VpcId')
+                      security_group_id = props.get('SecurityGroupId')
+                      region = props.get('Region')
+                      subnet_ids = props.get('SubnetIds')
+
+                      #ensure_ec2_endpoint(ec2, vpc_id, subnet_ids, security_group_id, region)
+
+                      if not all([vpc_id, security_group_id, region, subnet_ids]):
+                          raise ValueError(f"Missing required properties. VpcId: {vpc_id}, SecurityGroupId: {security_group_id}, Region: {region}, SubnetIds: {subnet_ids}")
+
+                      logger.info(f"Properties extracted - VPC: {vpc_id}, SG: {security_group_id}, Region: {region}, Subnets: {subnet_ids}")
+
+                      if isinstance(subnet_ids, str):
+                          subnet_ids = subnet_ids.split(',')
+
+                      filtered_subnet_ids = select_one_subnet_per_az(ec2, subnet_ids)
+                      logger.info(f"Filtered subnets (one per AZ): {filtered_subnet_ids}")
+
+                      services = [
+                          f"com.amazonaws.{region}.sts",
+                          f"com.amazonaws.{region}.secretsmanager",
+                          f"com.amazonaws.{region}.redshift-serverless",
+                          f"com.amazonaws.{region}.ssm",
+                          f"com.amazonaws.{region}.lambda",
+                          f"com.amazonaws.{region}.cloudformation",
+                          f"com.amazonaws.{region}.redshift"
+
+                      ]
+                      logger.info(f"Services to process: {services}")
+
+                      logger.info("Describing existing VPC endpoints...")
+                      response = ec2.describe_vpc_endpoints(
+                          Filters=[
+                              {'Name': 'vpc-id', 'Values': [vpc_id]},
+                              {'Name': 'service-name', 'Values': services}
+                          ]
+                      )
+
+                      existing_endpoints = {
+                          endpoint['ServiceName']: endpoint['VpcEndpointId']
+                          for endpoint in response['VpcEndpoints']
+                      }
+                      logger.info(f"Existing endpoints: {existing_endpoints}")
+
+                      endpoint_ids = []
+
+                      for service in services:
+                          logger.info(f"Processing service: {service}")
+                          if service in existing_endpoints:
+                              endpoint_id = existing_endpoints[service]
+                              logger.info(f"Updating existing endpoint {endpoint_id}")
+                              try:
+                                  ec2.modify_vpc_endpoint(
+                                      VpcEndpointId=endpoint_id,
+                                      AddSecurityGroupIds=[security_group_id]
+                                  )
+                                  endpoint_ids.append(endpoint_id)
+                                  logger.info(f"Successfully updated endpoint {endpoint_id}")
+                              except Exception as e:
+                                  logger.error(f"Error updating endpoint {endpoint_id}: {str(e)}")
+                                  logger.error(f"Traceback: {traceback.format_exc()}")
+                                  raise
+                          else:
+                              logger.info(f"Creating new endpoint for {service}")
+                              service_supported_subnets = select_supported_subnets(ec2, filtered_subnet_ids, service)
+                              try:
+                                  response = ec2.create_vpc_endpoint(
+                                      VpcEndpointType='Interface',
+                                      VpcId=vpc_id,
+                                      ServiceName=service,
+                                      SubnetIds=service_supported_subnets,
+                                      SecurityGroupIds=[security_group_id],
+                                      PrivateDnsEnabled=True
+                                  )
+                                  new_endpoint_id = response['VpcEndpoint']['VpcEndpointId']
+                                  endpoint_ids.append(new_endpoint_id)
+                                  logger.info(f"Successfully created endpoint {new_endpoint_id}")
+                              except Exception as e:
+                                  logger.error(f"Error creating endpoint for {service}: {str(e)}")
+                                  logger.error(f"Traceback: {traceback.format_exc()}")
+                                  raise
+
+                      response_data = {'EndpointIds': endpoint_ids}
+                      logger.info(f"Sending success response: {response_data}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      logger.info(f"Request type is {event['RequestType']}, sending success response")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'EndpointIds': []})
+
+              except Exception as e:
+                  error_msg = f"Error in handler: {str(e)}"
+                  logger.error(error_msg)
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+
+      Runtime: python3.13
+      Timeout: 900
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkConfig.SecurityGroupId
+        SubnetIds: !GetAtt NetworkConfig.SubnetIds
+
+
+  VPCEndpointUpdate:
+    Type: Custom::VPCEndpointUpdate
+    DependsOn: NetworkConfig
+    Properties:
+      ServiceToken: !GetAtt VPCEndpointChecker.Arn
+      VpcId: !GetAtt NetworkConfig.VpcId
+      Region: !Ref AWS::Region
+      SecurityGroupId: !GetAtt NetworkConfig.SecurityGroupId
+      SubnetIds: !GetAtt NetworkConfig.SubnetIds
+
+
+
+
+  RedshiftIngressRulesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+
+
+  GlueConnectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.13
+      Timeout: 300
+      Role: !GetAtt GlueConnectionFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      subnet_id = event['ResourceProperties']['SubnetId']
+
+                      # Get subnet AZ
+                      ec2 = boto3.client('ec2')
+                      response = ec2.describe_subnets(SubnetIds=[subnet_id])
+                      az = response['Subnets'][0]['AvailabilityZone']
+
+                      response_data = {
+                          'AvailabilityZone': az,
+                          'SubnetId': subnet_id
+                      }
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkConfig.SecurityGroupId
+        SubnetIds: !GetAtt NetworkConfig.SubnetIds
+
+
+
+  GlueConnectionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2AndVPCAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 Describe Actions
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeInstances
+                Resource: "*"
+
+              # Network Interface Actions
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AttachNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: "*"
+
+
+  GlueConnectionSubnet:
+    Type: Custom::GlueConnectionSubnet
+    DependsOn: NetworkConfig
+    Properties:
+      ServiceToken: !GetAtt GlueConnectionFunction.Arn
+      SubnetId: !Select [0, !GetAtt NetworkConfig.SubnetIds]
+
+  GlueConnection:
+    Type: AWS::Glue::Connection
+    DependsOn:
+      - NetworkConfig
+      - VPCEndpointUpdate
+      - SecurityGroupCheck
+      - GlueConnectionSubnet
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        ConnectionType: NETWORK
+        ConnectionProperties: {}  # Empty for NETWORK type
+        Name: !Sub ${AWS::StackName}-glue-connection
+        PhysicalConnectionRequirements:
+          SecurityGroupIdList:
+            - !GetAtt NetworkConfig.SecurityGroupId
+          SubnetId: !GetAtt GlueConnectionSubnet.SubnetId
+          AvailabilityZone: !GetAtt GlueConnectionSubnet.AvailabilityZone
+
+  RedshiftAccessIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-redshift-access-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - redshift.amazonaws.com
+                - glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: RedshiftS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${DataBucketName}
+
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${DataBucketName}/unload/*
+                  - !Sub arn:aws:s3:::${DataBucketName}/temporary/*
+                  - !Sub arn:aws:s3:::${BucketName}/redshift-tenant-migration/*
+              - Effect: Allow
+                Action:
+                  - redshift:GetClusterCredentials
+                  - redshift:DescribeClusters
+                  - redshift:ModifyClusterIamRoles
+                  - redshift-serverless:GetCredentials
+                  - redshift-serverless:ListWorkgroups
+                  - redshift-serverless:GetWorkgroup
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecrets
+                Resource: '*'
+
+
+  TenantPythonShellJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: redshift_schema_migration_job
+      SecurityConfiguration: !Ref GlueSecurityConfiguration
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${BucketName}/redshift-tenant-migration/scripts/redshift_schema_migration_job.py"
+      MaxCapacity: 1.0
+      Timeout: 30
+      GlueVersion: "3.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      DefaultArguments:
+        "--TARGET_SECRET_ARN": !Ref TargetSecretArn
+        "--SOURCE_SECRET_ARN": !Ref SourceSecretArn
+        "--AWS_REGION": !Ref Region
+        "--enable-glue-datacatalog": "true"
+        "--library-set": "analytics"
+        "--S3_BUCKET": !Ref BucketName
+        "--TempDir": !Sub "s3://${DataBucketName}/temporary/"
+        "--RETRY": "3"
+        "--S3_PREFIX": "redshift-tenant-migration/shell-scripts/"
+        "--LOAD_THREADS": "4"
+        "--enable-job-insights": "false"
+        "--enable-observability-metrics": "false"
+        "--TENANT_NAME": !Ref TenantName
+        "--job-language": "python"
+        "--SCHEMAS": !Ref Schema
+        "--extra-py-files": !Sub "s3://${BucketName}/redshift-tenant-migration/libraries/glue-psycopg2-dependencies.zip"
+      Connections:
+        Connections:
+          - !Ref GlueConnection
+
+  FetchRedshiftTablesFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - NetworkConfig
+      - VPCEndpointUpdate
+      - SecurityGroupCheck
+    Properties:
+      FunctionName: fetch_redshift_tables_list
+      Runtime: python3.13
+      Handler: fetch_redshift_tables_list.lambda_handler
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: redshift-tenant-migration/lambda/fetch_redshift_tables_list.zip
+      Layers:
+      - !Ref RedshiftConnectorLayer  # Add this line to attach the layer
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkConfig.SecurityGroupId
+        SubnetIds: !GetAtt NetworkConfig.SubnetIds
+      Environment:
+        Variables:
+          IAM_ROLE: !GetAtt RedshiftAccessIamRole.Arn
+
+
+  TenantSparkJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: redshift-data-migration-spark-job
+      SecurityConfiguration: !Ref GlueSecurityConfiguration
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${BucketName}/redshift-tenant-migration/scripts/redshift-data-migration-spark-job.py"
+      MaxRetries: 0
+      Timeout: 30
+      GlueVersion: "5.0"
+      NumberOfWorkers: 2
+      WorkerType: "G.2X"
+      ExecutionProperty:
+        MaxConcurrentRuns: 100
+      DefaultArguments:
+        "--TARGET_SECRET_ARN": !Ref TargetSecretArn
+        "--SOURCE_SECRET_ARN": !Ref SourceSecretArn
+        "--IAM_ROLE": !GetAtt RedshiftAccessIamRole.Arn
+        "--S3_BUCKET": !Sub s3://${DataBucketName}/unload
+        "--SCHEMAS": !Ref Schema
+        "--TABLE_NAME": "customers"
+        "--TempDir": !Sub "s3://${DataBucketName}/temporary/"
+        "--additional-python-modules": !Sub s3://${BucketName}/redshift-tenant-migration/libraries/psycopg2_binary-2.9.10-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+      Connections:
+        Connections:
+          - !Ref GlueConnection    # Make sure to define this as a parameter or reference an existing connection
+
+  RedshiftViewsAndUsers:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: redshift_views_users_setup
+      SecurityConfiguration: !Ref GlueSecurityConfiguration
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${BucketName}/redshift-tenant-migration/scripts/refresh_views_glue_job.py"
+      MaxCapacity: 1.0
+      Timeout: 30
+      GlueVersion: "3.0"
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      DefaultArguments:
+        "--TARGET_SECRET_ARN": !Ref TargetSecretArn
+        "--SOURCE_SECRET_ARN": !Ref SourceSecretArn
+        "--enable-glue-datacatalog": "true"
+        "--library-set": "analytics"
+        "--S3_BUCKET": !Ref BucketName
+        "--TempDir": !Sub "s3://${DataBucketName}/temporary/"
+        "--RETRY": "3"
+        "--S3_PREFIX": "redshift-tenant-migration/shell-scripts/"
+        "--LOAD_THREADS": "4"
+        "--enable-job-insights": "false"
+        "--enable-observability-metrics": "false"
+        "--TENANT_NAME": !Ref TenantName
+        "--job-language": "python"
+        "--SCHEMAS": !Ref Schema
+        "--AWS_REGION": !Ref Region
+      Connections:
+        Connections:
+          - !Ref GlueConnection
+
+  CollectFailedTablesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-collect-failed-tables"
+      Runtime: python3.13
+      Handler: collect_failed_tables.handler
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: redshift-tenant-migration/lambda/collect_failed_tables.zip
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DataBucketName
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - FetchRedshiftTablesFunction
+      - StepFunctionsLogGroup
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Add this new statement for Step Functions execution
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Join ["", ["arn:aws:states:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":stateMachine:*"]]
+              # Existing statements below
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Join ["", ["arn:aws:glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":job/", !Ref TenantPythonShellJob]]
+                  - !Join ["", ["arn:aws:glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":job/", !Ref TenantSparkJob]]
+                  - !Join ["", ["arn:aws:glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":job/", !Ref RedshiftViewsAndUsers]]
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FetchRedshiftTablesFunction.Arn
+                  - !GetAtt CollectFailedTablesFunction.Arn
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt StepFunctionsLogGroup.Arn
+                  - !Join ["", [!GetAtt StepFunctionsLogGroup.Arn, ":*"]]
+
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt GlueCloudWatchKMSKey.Arn
+
+  MigrationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - StatesExecutionRole
+      - FetchRedshiftTablesFunction
+      - GlueConnection
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      Definition:
+        Comment: "A description of my state machine"
+        StartAt: "CreateSchemaObjects"
+        States:
+          "CreateSchemaObjects":
+            Type: Task
+            Resource: "arn:aws:states:::glue:startJobRun.sync"
+            Parameters:
+              JobName: !Ref TenantPythonShellJob
+              Arguments:
+                "--SCHEMAS.$": "$.SCHEMAS"
+                "--SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                "--TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+                "--TENANT_NAME.$": "$.TENANT_NAME"
+            Next: "Lambda Invoke"
+            ResultPath: "$.null"
+
+          "Lambda Invoke":
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt FetchRedshiftTablesFunction.Arn
+              Payload:
+                "SCHEMAS.$": "$.SCHEMAS"
+                "SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                "TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+                "TENANT_NAME.$": "$.TENANT_NAME"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 1
+                MaxAttempts: 3
+                BackoffRate: 2
+                JitterStrategy: "FULL"
+            Next: "Map"
+            ResultPath: "$.LambdaResult"
+
+          "Map":
+            Type: Map
+            ItemsPath: "$.LambdaResult.Payload.Payload"
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: "INLINE"
+              StartAt: "InvokeGlueJobForTable"
+              States:
+                "InvokeGlueJobForTable":
+                  Type: Task
+                  Resource: "arn:aws:states:::glue:startJobRun.sync"
+                  Parameters:
+                    JobName: !Ref TenantSparkJob
+                    Arguments:
+                      "--SCHEMAS.$": "$.SCHEMAS"
+                      "--TABLE_NAME.$": "$.TABLE_NAME"
+                      "--SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                      "--TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+                  Retry:
+                    - ErrorEquals:
+                        - Glue.AWSGlueException
+                        - Glue.ConcurrentRunsExceededException
+                      IntervalSeconds: 30
+                      MaxAttempts: 2
+                      BackoffRate: 2
+                      JitterStrategy: "FULL"
+                  Catch:
+                    - ErrorEquals:
+                        - States.ALL
+                      ResultPath: "$.error"
+                      Next: "HandleError"
+                  Next: "HandleSuccess"
+                  ResultPath: "$.glueResult"
+
+                "HandleSuccess":
+                  Type: Pass
+                  Parameters:
+                    status: "succeeded"
+                    "table.$": "$.TABLE_NAME"
+                    "schema.$": "$.SCHEMAS"
+                  End: true
+
+                "HandleError":
+                  Type: Fail
+                  Error: "TableMigrationFailed"
+                  CausePath: "States.Format('table={}, schema={}, error={}, cause={}', $.TABLE_NAME, $.SCHEMAS, $.error.Error, $.error.Cause)"
+            MaxConcurrency: 10
+            ToleratedFailurePercentage: 20
+            ResultPath: "$.MapResults"
+            Catch:
+              - ErrorEquals:
+                  - States.ExceedToleratedFailureThreshold
+                ResultPath: "$.MapError"
+                Next: "CollectFailedTablesOnThresholdBreach"
+            Next: "CollectFailedTables"
+
+          "CollectFailedTables":
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt CollectFailedTablesFunction.Arn
+              Payload:
+                "MapResults.$": "$.MapResults"
+                "SCHEMAS.$": "$.SCHEMAS"
+                "TENANT_NAME.$": "$.TENANT_NAME"
+                "SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                "TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            ResultPath: "$.FailedTablesResult"
+            Next: "RefreshMaterializedViews"
+
+          "CollectFailedTablesOnThresholdBreach":
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: !GetAtt CollectFailedTablesFunction.Arn
+              Payload:
+                "MapResults.$": "$.MapResults"
+                "SCHEMAS.$": "$.SCHEMAS"
+                "TENANT_NAME.$": "$.TENANT_NAME"
+                "SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                "TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2
+            ResultPath: "$.FailedTablesResult"
+            Next: "MigrationFailedReport"
+
+          "MigrationFailedReport":
+            Type: Pass
+            Parameters:
+              "migration_summary":
+                "status": "FAILED - exceeded 20% table failure threshold"
+                "failed_count.$": "$.FailedTablesResult.Payload.failed_count"
+                "total_tables.$": "$.FailedTablesResult.Payload.total_tables"
+                "failed_tables.$": "$.FailedTablesResult.Payload.failed_tables"
+                "report_location.$": "$.FailedTablesResult.Payload.report_location"
+                "retry_input_location.$": "$.FailedTablesResult.Payload.retry_input_location"
+                "message": "More than 20% of tables failed. Download retry_failed_tables.json from S3 and use it to re-run only the failed tables."
+            End: true
+
+          "RefreshMaterializedViews":
+            Type: Task
+            Resource: "arn:aws:states:::glue:startJobRun.sync"
+            Parameters:
+              JobName: !Ref RedshiftViewsAndUsers
+              Arguments:
+                "--SCHEMAS.$": "$.SCHEMAS"
+                "--SOURCE_SECRET_ARN.$": "$.SOURCE_SECRET_ARN"
+                "--TARGET_SECRET_ARN.$": "$.TARGET_SECRET_ARN"
+                "--TENANT_NAME.$": "$.TENANT_NAME"
+            ResultPath: "$.ViewsResult"
+            Next: "GenerateMigrationReport"
+
+          "GenerateMigrationReport":
+            Type: Pass
+            Parameters:
+              "migration_summary":
+                "status": "completed"
+                "schemas.$": "$.SCHEMAS"
+                "tenant.$": "$.TENANT_NAME"
+                "total_tables.$": "$.FailedTablesResult.Payload.total_tables"
+                "succeeded_count.$": "$.FailedTablesResult.Payload.succeeded_count"
+                "failed_count.$": "$.FailedTablesResult.Payload.failed_count"
+                "failed_tables.$": "$.FailedTablesResult.Payload.failed_tables"
+                "report_location.$": "$.FailedTablesResult.Payload.report_location"
+                "retry_input_location.$": "$.FailedTablesResult.Payload.retry_input_location"
+                "views_refresh": "completed"
+            End: true
+
+      StateMachineType: STANDARD
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+
+
+  # Create the log group with encryption
+  StepFunctionsLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: !Sub "/aws/stepfunctions/${AWS::StackName}"
+        RetentionInDays: 30
+        KmsKeyId: !GetAtt GlueCloudWatchKMSKey.Arn
+
+  # S3 Lifecycle Policy — Auto-expire intermediate UNLOAD data after 7 days
+  # Addresses T10 (stale data exposure) by ensuring intermediate data does not persist indefinitely
+  S3LifecyclePolicyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-s3-lifecycle-policy"
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt S3LifecyclePolicyRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      expiration_days = int(event['ResourceProperties'].get('ExpirationDays', 7))
+
+                      s3 = boto3.client('s3')
+                      s3.put_bucket_lifecycle_configuration(
+                          Bucket=bucket_name,
+                          LifecycleConfiguration={
+                              'Rules': [
+                                  {
+                                      'ID': 'ExpireUnloadData',
+                                      'Status': 'Enabled',
+                                      'Filter': {'Prefix': 'unload/'},
+                                      'Expiration': {'Days': expiration_days},
+                                      'NoncurrentVersionExpiration': {'NoncurrentDays': 1}
+                                  },
+                                  {
+                                      'ID': 'ExpireTemporaryData',
+                                      'Status': 'Enabled',
+                                      'Filter': {'Prefix': 'temporary/'},
+                                      'Expiration': {'Days': 3},
+                                      'NoncurrentVersionExpiration': {'NoncurrentDays': 1}
+                                  }
+                              ]
+                          }
+                      )
+                      logger.info(f"Lifecycle policy applied to {bucket_name}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'BucketName': bucket_name})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  S3LifecyclePolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3LifecyclePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                Resource:
+                  - !Sub "arn:aws:s3:::${DataBucketName}"
+
+  S3LifecyclePolicyCustomResource:
+    Type: Custom::S3LifecyclePolicy
+    DependsOn: S3LifecyclePolicyFunction
+    Properties:
+      ServiceToken: !GetAtt S3LifecyclePolicyFunction.Arn
+      BucketName: !Ref DataBucketName
+      ExpirationDays: 7
+
+Outputs:
+  StateMachineArn:
+    Description: "ARN of the State Machine"
+    Value: !Ref MigrationStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  StateMachineRoleArn:
+    Description: "ARN of the State Machine execution role"
+    Value: !GetAtt StatesExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineRoleArn"
+
+  SchemaGlueJob:
+    Description: 'Name of the created schema Glue job'
+    Value: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${TenantPythonShellJob}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SchemaGlueJob"
+
+  UnloadGlueJob:
+    Description: 'Name of the created load/unload Glue job'
+    Value: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${TenantSparkJob}"
+    Export:
+      Name: !Sub "${AWS::StackName}-UnloadGlueJob"
+
+  GlueServiceRoleARN:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueServiceRoleARN"
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FetchRedshiftTablesFunction}"
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionName"
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function to fetch table list'
+    Value: !GetAtt FetchRedshiftTablesFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  RedshiftViewsAndUsers:
+    Description: 'Glue Job for Redshift users and views'
+    Value: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${RedshiftViewsAndUsers}"
+    Export:
+      Name: !Sub "${AWS::StackName}-RedshiftViewsAndUsers"
+
+  SecurityGroupId:
+    Description: Security Group ID used for migration components
+    Value: !GetAtt NetworkConfig.SecurityGroupId
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroupId
+
+  SecurityGroupSelfReferenceStatus:
+    Description: Status of self-referencing rule check
+    Value: !GetAtt SecurityGroupCheck.Status
+
+  VPCEndpoints:
+    Description: VPC Endpoints (Created or Updated)
+    Value: !Join [", ", !GetAtt VPCEndpointUpdate.EndpointIds]
+
+  RedshiftAccessRoleArn:
+    Description: ARN of the created IAM role
+    Value: !GetAtt RedshiftAccessIamRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-redshift-access-role-arn
+
+  RedshiftAccessRoleName:
+    Description: Name of the created IAM role
+    Value: !Ref RedshiftAccessIamRole
+    Export:
+      Name: !Sub ${AWS::StackName}-redshift-access-role-name

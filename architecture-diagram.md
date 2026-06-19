@@ -23,35 +23,13 @@ This migration solution provides:
 ✅ **Monitoring**: CloudWatch logs with detailed execution tracking  
 ✅ **Error Handling**: Automatic retries and graceful failure recovery  
 
-### Intended Audience
-
-This migration template is intended for:
-- **Database Administrators (DBAs)** responsible for managing Redshift clusters and serverless workgroups
-- **Database Owners** who oversee schema design, user access, and data integrity
-- **Cloud Infrastructure Engineers** managing AWS environments and networking
-- **Platform / DevOps Teams** responsible for provisioning and orchestrating cloud resources
-
-> ⚠️ This template should **not** be used by application developers or end users without DBA oversight. It performs privileged operations including user creation, permission grants, DDL migration, and system table access.
-
-### Credential Requirements
-
-The secrets stored in AWS Secrets Manager for both source and target Redshift environments **must use master-level (superuser) credentials**. This is required because the migration process needs to:
-
-- Access Redshift system tables (`pg_user_info`, `svv_all_schemas`, `pg_catalog`, etc.) to extract users, groups, and permissions
-- Create and alter users and groups on the target cluster/workgroup
-- Execute `GRANT` and `REVOKE` statements across schemas
-- Run `UNLOAD` and `COPY` commands with IAM role association
-- Create and modify database objects (tables, views, stored procedures) across tenant schemas
-
-Using non-superuser credentials will result in incomplete migrations — system table queries will return partial results and permission/user operations will fail silently or with errors.
-
 ## Architecture
 
 ### High-Level Architecture
 
-![High-Level Architecture](extracted_images/high-level-arch.png)
+![High-Level Architecture](extracted_images/High-level-arch%20(1).png)
 
-![Low-Level Architecture](extracted_images/low-level-arch.png)
+![Architecture Diagram](extracted_images/Picture%201.png)
 
 ### Components
 
@@ -138,26 +116,6 @@ Step 4: RefreshMaterializedViews (Glue Python Shell)
 - CloudFormation deployment permissions
 - VPC with private subnets for Glue jobs
 - Existing S3 buckets for scripts and data storage
-
-### IAM Permissions for Deploying User
-
-The user or role deploying this CloudFormation stack requires permissions across multiple AWS services. A ready-to-use IAM policy is provided at [`cloudformation/deployment-iam-policy.json`](cloudformation/deployment-iam-policy.json).
-
-To create and attach this policy:
-
-```bash
-# Create the IAM policy
-aws iam create-policy \
-  --policy-name RedshiftMigrationDeploymentPolicy \
-  --policy-document file://cloudformation/deployment-iam-policy.json
-
-# Attach to your IAM user or role
-aws iam attach-user-policy \
-  --user-name <your-iam-username> \
-  --policy-arn arn:aws:iam::<account-id>:policy/RedshiftMigrationDeploymentPolicy
-```
-
-The policy covers: CloudFormation stack operations, IAM role/policy creation, KMS key management, Glue jobs and connections, Lambda functions and layers, Step Functions state machines, CloudWatch log groups, EC2 networking (VPC endpoints, security groups), SSM parameter reads, and Secrets Manager access.
 
 ### Network Requirements
 
@@ -627,151 +585,32 @@ aws stepfunctions start-execution \
 
 Scripts are **idempotent** - they check for existing objects and skip creation if already present.
 
-### Retry Individual Failed Tables
+## Alternative: Snapshot Restore Migration
 
-After the data migration (Map State) completes, a Lambda function (`CollectFailedTables`) automatically generates a migration report and retry input file in S3. If more than 20% of tables fail, the Step Function stops and provides the report location.
+For large-scale migrations, use Redshift's native snapshot restore capability:
 
-#### 1. Check the Migration Report
+### Process
 
-The report is saved to S3 at:
-```
-s3://<data-bucket>/migration-reports/<tenant>/<timestamp>/migration_report.json
-```
+1. **Create snapshot** of source cluster
+2. **Restore snapshot** to target cluster/workgroup
+3. **Update tenant configuration** using Lambda function
 
-Download and review it:
-```bash
-aws s3 cp s3://<data-bucket>/migration-reports/<tenant>/<timestamp>/migration_report.json .
-cat migration_report.json
-```
+### Post-Restore Steps
 
-The report contains:
+Execute the `tenant_cloudformation_stack_update` Lambda function:
+
 ```json
 {
-  "timestamp": "2026-03-18T04-30-00",
-  "tenant": "sales_data",
-  "total_tables": 10,
-  "succeeded_count": 8,
-  "failed_count": 2,
-  "succeeded_tables": ["customers", "products", ...],
-  "failed_tables": [
-    {
-      "table": "orders",
-      "schema": "sales_data",
-      "error": "TableMigrationFailed",
-      "cause": "COPY failed: date conversion error"
-    }
-  ]
+  "source_secret_arn": "arn:aws:secretsmanager:us-east-1:account:secret:source-secret-abc123",
+  "target_secret_arn": "arn:aws:secretsmanager:us-east-1:account:secret:target-secret-def456",
+  "consumer_secret_arn": "arn:aws:secretsmanager:us-east-1:account:secret:consumer-secret-ghi789",
+  "tenant_name": "tenant_name",
+  "tenant_stack_name": "tenant-stack-name",
+  "schemas": "('schema_name')"
 }
 ```
 
-#### 2. Download the Retry Input File
-
-A retry payload is automatically generated alongside the report:
-```
-s3://<data-bucket>/migration-reports/<tenant>/<timestamp>/retry_failed_tables.json
-```
-
-```bash
-aws s3 cp s3://<data-bucket>/migration-reports/<tenant>/<timestamp>/retry_failed_tables.json .
-cat retry_failed_tables.json
-```
-
-The retry file contains:
-```json
-{
-  "tables": [
-    {
-      "SCHEMAS": "sales_data",
-      "TABLE_NAME": "orders",
-      "SOURCE_SECRET_ARN": "arn:aws:secretsmanager:...:secret:source-xxx",
-      "TARGET_SECRET_ARN": "arn:aws:secretsmanager:...:secret:target-yyy"
-    }
-  ]
-}
-```
-
-#### 3. Retry a Single Table
-
-To retry a specific failed table, start the data migration Glue job directly with the table name:
-
-```bash
-aws glue start-job-run \
-  --job-name <data-migration-glue-job-name> \
-  --arguments '{
-    "--SCHEMAS": "sales_data",
-    "--TABLE_NAME": "orders",
-    "--S3_BUCKET": "s3://<data-bucket>/unload",
-    "--IAM_ROLE": "arn:aws:iam::<account-id>:role/<redshift-access-role>",
-    "--SOURCE_SECRET_ARN": "arn:aws:secretsmanager:...:secret:source-xxx",
-    "--TARGET_SECRET_ARN": "arn:aws:secretsmanager:...:secret:target-yyy"
-  }'
-```
-
-#### 4. Retry All Failed Tables
-
-To retry all failed tables from the retry file, run each entry:
-
-```bash
-# Parse retry file and start a Glue job for each failed table
-for table in $(cat retry_failed_tables.json | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for t in data['tables']:
-    print(t['TABLE_NAME'])
-"); do
-  echo "Retrying table: $table"
-  aws glue start-job-run \
-    --job-name <data-migration-glue-job-name> \
-    --arguments "{
-      \"--SCHEMAS\": \"sales_data\",
-      \"--TABLE_NAME\": \"$table\",
-      \"--S3_BUCKET\": \"s3://<data-bucket>/unload\",
-      \"--IAM_ROLE\": \"arn:aws:iam::<account-id>:role/<redshift-access-role>\",
-      \"--SOURCE_SECRET_ARN\": \"arn:aws:secretsmanager:...:secret:source-xxx\",
-      \"--TARGET_SECRET_ARN\": \"arn:aws:secretsmanager:...:secret:target-yyy\"
-    }"
-done
-```
-
-> ⚠️ Replace `<data-migration-glue-job-name>`, bucket names, IAM role ARN, and secret ARNs with your actual values from the CloudFormation stack outputs.
-
-## Post-Migration Activities
-
-### User Password Reset (Required)
-
-During migration, users are created on the target cluster with a randomly generated temporary password. The DBA must reset passwords for all migrated users after the migration completes.
-
-**Option 1: Manually reset each user's password**
-
-```sql
--- Reset password for a specific user
-ALTER USER "username" PASSWORD 'new_secure_password';
-
--- List all migrated users to identify who needs a reset
-SELECT usename FROM pg_user_info WHERE usename LIKE '%<tenant_name>%';
-```
-
-**Option 2: Set a short-lived password to force a reset**
-
-Redshift does not support a native "force change on next login" flag. Instead, set a near-future expiry so users must contact the DBA for a new password:
-
-```sql
-ALTER USER "username" PASSWORD 'temp_password' VALID UNTIL '2026-03-15';
-```
-
-**Option 3: Migrate password hashes from source (preserves original passwords)**
-
-Extract the MD5 password hash from the source cluster and apply it on the target. This lets users keep their existing passwords with no disruption:
-
-```sql
--- On source: extract the password hash
-SELECT usename, passwd FROM pg_catalog.pg_shadow WHERE usename = 'username';
-
--- On target: set the hash directly (use the md5 hash value from source)
-ALTER USER "username" PASSWORD 'md5<hash_from_source>';
-```
-
-> ⚠️ Whichever option you choose, ensure passwords are communicated securely and comply with your organization's credential management policies.
+This updates the tenant's CloudFormation stack to point to the new endpoint.
 
 ## Key Differences: Provisioned vs Serverless
 
@@ -796,7 +635,7 @@ ALTER USER "username" PASSWORD 'md5<hash_from_source>';
 
 - **KMS Keys**: Customer-managed keys for Glue jobs and CloudWatch logs
 - **Secrets Manager**: Encrypted credential storage
-- **S3**: Server-side encryption for data at rest
+- **S3**: Server-side encryption for data in transit
 - **CloudWatch Logs**: Encrypted with KMS
 
 ### Network Security
